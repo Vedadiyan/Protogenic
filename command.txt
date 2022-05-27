@@ -1,0 +1,1 @@
+protoc --plugin=protoc-gen-protogentest=./protogentest.exe  --proto_path=src --go_out=./  -I ./ test.proto --protogentest_out=./

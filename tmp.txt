@@ -1,0 +1,116 @@
+package natsencoder
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"time"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/nats-io/nats.go"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+)
+
+type Test struct{}
+
+type TestHandler func(test Test) (*Test, error)
+type ErrorHandler func(err error)
+
+func TestServer(con *nats.EncodedConn, testHandler TestHandler, errorHandler ErrorHandler) *nats.Subscription {
+	subscription, _ := con.Subscribe("", func(subject string, reply string, test Test) {
+		output, err := testHandler(test)
+		err = con.Publish(reply, *output)
+		if err != nil {
+			errorHandler(err)
+		}
+	})
+	return subscription
+}
+
+func TestClient(con *nats.EncodedConn, timeout time.Duration) TestHandler {
+	return func(test Test) (*Test, error) {
+		var response Test
+		err := con.Request("", test, &response, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return &response, nil
+	}
+}
+
+type ProtoEncoder struct {
+}
+
+func (protoEncoder ProtoEncoder) Encode(subject string, v interface{}) ([]byte, error) {
+	value, ok := v.(protoreflect.ProtoMessage)
+	if !ok {
+		return nil, errors.New(fmt.Sprintf("The type '%s' is not a registered protobuffer type.", reflect.TypeOf(v).Name()))
+	}
+	output, err := proto.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return compress(output)
+}
+
+func (protoEncoder ProtoEncoder) Decode(subject string, data []byte, vPtr interface{}) error {
+	value, ok := vPtr.(protoreflect.ProtoMessage)
+	if !ok {
+		return errors.New(fmt.Sprintf("The type '%s' is not a registered protobuffer type.", reflect.TypeOf(vPtr).Name()))
+	}
+	data, err := decompress(data)
+	if err != nil {
+		return err
+	}
+	err = proto.Unmarshal(data, value)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func compress(data []byte) ([]byte, error) {
+	r := bytes.NewReader(data)
+	pr, pw := io.Pipe()
+	zw, err := zstd.NewWriter(pw)
+	if err != nil {
+		return nil, err
+	}
+	n, err := io.Copy(zw, r)
+	go func() {
+		_ = zw.Close()
+		_ = pw.Close()
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if n != int64(len(data)) {
+		return nil, errors.New("error")
+	}
+	fmt.Println(len(data))
+	return io.ReadAll(pr)
+}
+
+func decompress(data []byte) ([]byte, error) {
+	r := bytes.NewReader(data)
+	pr, pw := io.Pipe()
+	zr, err := zstd.NewReader(pr)
+	if err != nil {
+		return nil, err
+	}
+	n, err := io.Copy(pw, r)
+	go func() {
+		_ = pw.Close()
+	}()
+	if err != nil {
+		return nil, err
+	}
+	if n != int64(len(data)) {
+		return nil, errors.New("error")
+	}
+	fmt.Println(len(data))
+	return io.ReadAll(zr)
+}
